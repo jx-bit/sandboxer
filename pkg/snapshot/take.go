@@ -244,15 +244,17 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	}()
 
 	// T2b: quiesce backends (steady state before the dump).
+	tQuiesce := time.Now()
 	s.Quiescer.Quiesce()
 	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
 	}
+	pm.Dur("take.quiesce", tQuiesce)
 
 	// T3: capture all disks once and emit Sandbox E while the same CH/backend
 	// freeze remains held. E is a dependency, not yet the operation root.
 	dumpStart := time.Now()
-	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{		CheckpointID: s.CheckpointID, checkpointState: checkpointState,
+	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{CheckpointID: s.CheckpointID, checkpointState: checkpointState,
 		SandboxID: s.SandboxID, PortableConfig: s.PortableConfig,
 		ParentSandboxRef: s.ParentSandboxRef, Diffs: s.Diffs,
 		LocalCodec: s.LocalCodec, LocalRequired: s.LocalRequired,
@@ -295,6 +297,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	var dirty []byte
 	var workingMemory sparse.Source
 	if s.CaptureMemory != nil {
+		tMemProbe := time.Now()
 		view, err := s.CaptureMemory(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("capture memory view: %w", err)
@@ -305,15 +308,21 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		if view.Size != uint64(s.MemfdSize) {
 			return nil, fmt.Errorf("capture memory size mismatch")
 		}
+		pm.Dur("take.mem_probe", tMemProbe)
+		tMemDirty := time.Now()
 		memorySource, dirty, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, s.MemoryWorkingSet)
 		if err != nil {
 			return nil, err
 		}
+		pm.Dur("take.mem_dirty", tMemDirty)
+		tMemWorking := time.Now()
 		workingMemory, _, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, true)
 		if err != nil {
 			return nil, err
 		}
+		pm.Dur("take.mem_working", tMemWorking)
 	} else {
+		tMemLayout := time.Now()
 		var holes, zeros []sparse.Extent
 		if s.MemoryLayout != nil {
 			holes, zeros, err = s.MemoryLayout()
@@ -324,6 +333,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 			return nil, fmt.Errorf("memory layout: %w", err)
 		}
 		memorySource = &releasedMemorySource{fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: holes, zeros: zeros}
+		pm.Dur("take.mem_layout", tMemLayout)
 	}
 	if workingMemory == nil {
 		workingMemory = memorySource

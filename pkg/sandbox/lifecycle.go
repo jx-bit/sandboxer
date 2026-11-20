@@ -31,8 +31,8 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
-	"github.com/kuasar-sandbox/sandboxer/pkg/perfmark"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/perfmark"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -1867,7 +1867,9 @@ func handleSnapshotRequest(
 	// gate, and a successful guest quiesce has already stopped the application;
 	// the following snapshot.Take is the first operation allowed to pause CH.
 	if memoryController != nil {
+		tFreeze := time.Now()
 		freeze, captureErr := memoryController.CaptureState(ctx)
+		p.Dur("snap.freeze_state", tFreeze)
 		if captureErr != nil {
 			logf("snapshot: freeze memory observation unavailable: %v", captureErr)
 		} else {
