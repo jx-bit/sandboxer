@@ -155,11 +155,22 @@ const (
 	PrefetchMemory PrefetchMode = "memory"
 )
 
+// PrefillMode selects whether restore batch-installs the self checkpoint
+// layer's data extents into the memfd while the VM is Paused (after CH
+// api-ready, before vm.resume). The empty value has the same semantics as off.
+type PrefillMode string
+
+const (
+	PrefillOff  PrefillMode = "off"
+	PrefillSelf PrefillMode = "self"
+)
+
 // RestoreConfig contains host-only policy for one restore invocation.
-// Prefetch is a string at the YAML boundary so invalid input survives parsing
-// and can be rejected with a field-specific validation error.
+// Prefetch and Prefill are strings at the YAML boundary so invalid input
+// survives parsing and can be rejected with a field-specific validation error.
 type RestoreConfig struct {
 	Prefetch string `yaml:"prefetch,omitempty"`
+	Prefill  string `yaml:"prefill,omitempty"`
 }
 
 // ParsePrefetchMode validates the public restore.prefetch spelling and returns
@@ -175,8 +186,24 @@ func ParsePrefetchMode(s string) (PrefetchMode, error) {
 	}
 }
 
+// ParsePrefillMode validates the public restore.prefill spelling and returns
+// its normalized mode. Empty means the default, off.
+func ParsePrefillMode(s string) (PrefillMode, error) {
+	switch PrefillMode(s) {
+	case "", PrefillOff:
+		return PrefillOff, nil
+	case PrefillSelf:
+		return PrefillSelf, nil
+	default:
+		return "", fmt.Errorf("restore.prefill %q invalid (want off|self)", s)
+	}
+}
+
 func (c RestoreConfig) validate() error {
-	_, err := ParsePrefetchMode(c.Prefetch)
+	if _, err := ParsePrefetchMode(c.Prefetch); err != nil {
+		return err
+	}
+	_, err := ParsePrefillMode(c.Prefill)
 	return err
 }
 

@@ -166,6 +166,10 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
+	prefillMode, err := config.ParsePrefillMode(opts.HostCfg.Restore.Prefill)
+	if err != nil {
+		return -1, err
+	}
 	if opts.SandboxID == "" {
 		opts.SandboxID = "rs-default"
 	}
@@ -508,6 +512,21 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	}
 	logf("snapshot source: %d memory layer(s)", len(memLayers))
 	p.Mark("restore.memory_source")
+	// P3 prefill binds a SELF-layer-only reader: the bundle stores exactly the
+	// Dirty∩Materialized pages captured at pause (the resume first-touch set).
+	// Walking the layered source instead would enumerate every parent/template
+	// extent and try to install the whole RAM — the opposite of the hot-set
+	// goal. Structural build failures only disable prefill (best-effort);
+	// they never fail the restore.
+	var prefillSource *uffd.StreamSnapshotSource
+	if prefillMode == config.PrefillSelf {
+		ps, err := uffd.NewStreamSnapshotSource(selfStream, capBytes)
+		if err != nil {
+			logf("restore prefill disabled: self-layer reader: %v", err)
+		} else {
+			prefillSource = ps
+		}
+	}
 	prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, root.stream, len(memLayers)-1, logf)
 	// Close is a lifetime boundary for fetch.Stream. Register this after every
 	// memory-layer Close defer so cancellation and join always run first.
@@ -691,6 +710,30 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}
 			p.Dur("restore.api_ready", tWaitReady)
+			// P3 prefill: batch-install self-layer extents while the VM is
+			// still Paused, so the resume first-dial storm hits resident
+			// folios instead of serialized per-window source reads
+			// (docs/optimizations/p3-uffd-prefill.md §2). Best-effort by
+			// design: any prefill failure logs and continues; the fault path
+			// converges whatever is left after resume.
+			if prefillSource != nil && pc.Uffd != nil {
+				if h := pc.Uffd(); h != nil {
+					tPrefill := time.Now()
+					st, err := h.Prefill(pc.Ctx, prefillSource)
+					p.Dur("restore.prefill", tPrefill)
+					p.MarkKV("restore.prefill_pages", map[string]any{
+						"pages": st.PagesCopied, "extents": st.Extents,
+						"skipped": st.Skipped, "bytes_read": st.BytesRead,
+						"read_ns": st.ReadNs, "copy_ns": st.CopyNs,
+						"capped": st.Capped,
+					})
+					if err != nil {
+						pc.Logf("restore prefill incomplete: %v (continuing)", err)
+					}
+				} else {
+					pc.Logf("restore prefill skipped: uffd handler not adopted")
+				}
+			}
 			tResume := time.Now()
 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)

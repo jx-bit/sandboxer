@@ -553,6 +553,59 @@ func TestParsePrefetchMode(t *testing.T) {
 	}
 }
 
+func TestParsePrefillMode(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  PrefillMode
+	}{
+		{"", PrefillOff},
+		{"off", PrefillOff},
+		{"self", PrefillSelf},
+	} {
+		got, err := ParsePrefillMode(tc.input)
+		if err != nil {
+			t.Errorf("ParsePrefillMode(%q): %v", tc.input, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("ParsePrefillMode(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+
+	if _, err := ParsePrefillMode("memory"); err == nil || !strings.Contains(err.Error(), "restore.prefill") {
+		t.Fatalf("ParsePrefillMode(memory) error = %v, want restore.prefill validation error", err)
+	}
+	if _, err := ParsePrefillMode(" self "); err == nil {
+		t.Fatal("ParsePrefillMode must accept only the literal self value")
+	}
+}
+
+func TestRestorePrefillValidation(t *testing.T) {
+	cfg, err := Load(writeYAML(t, minimalCold+"\nrestore:\n  prefill: self\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Restore.Prefill != "self" {
+		t.Fatalf("restore.prefill = %q, want self", cfg.Restore.Prefill)
+	}
+	if err := cfg.ValidateCold(); err != nil {
+		t.Fatalf("ValidateCold(self): %v", err)
+	}
+	if err := cfg.ValidateRestoreHostConfig(); err != nil {
+		t.Fatalf("ValidateRestoreHostConfig(self): %v", err)
+	}
+
+	cfg.Restore.Prefill = "memory"
+	for name, validate := range map[string]func() error{
+		"cold":    cfg.ValidateCold,
+		"restore": cfg.ValidateRestoreHostConfig,
+	} {
+		if err := validate(); err == nil || !strings.Contains(err.Error(), "restore.prefill") {
+			t.Errorf("%s validation error = %v, want restore.prefill error", name, err)
+		}
+	}
+}
+
 func TestRestorePrefetchValidation(t *testing.T) {
 	cfg, err := Load(writeYAML(t, minimalCold+"\nrestore:\n  prefetch: memory\n"))
 	if err != nil {

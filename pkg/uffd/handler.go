@@ -216,6 +216,12 @@ type handlerStats struct {
 	tailZeroNs      atomic.Uint64
 	tailConflicts   atomic.Uint64
 	tailPartial     atomic.Uint64
+
+	// Restore prefill (Prefill): batch-installed self-layer extents while
+	// the VM is Paused. prefillNs is the wall duration of the whole pass.
+	prefillExtents atomic.Uint64
+	prefillPages   atomic.Uint64
+	prefillNs      atomic.Uint64
 }
 
 type faultEvent struct {
@@ -907,6 +913,9 @@ func (h *Handler) Stats() map[string]uint64 {
 		"tail_zero_ns":          h.stats.tailZeroNs.Load(),
 		"tail_conflicts":        h.stats.tailConflicts.Load(),
 		"tail_partial":          h.stats.tailPartial.Load(),
+		"prefill_extents":       h.stats.prefillExtents.Load(),
+		"prefill_pages":         h.stats.prefillPages.Load(),
+		"prefill_ns":            h.stats.prefillNs.Load(),
 	}
 }
 
