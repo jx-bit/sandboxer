@@ -90,6 +90,12 @@ type PostSpawnCtx struct {
 	CHSock       string
 	Logf         func(string, ...any)
 	NotifyReady  func()
+	// Uffd exposes the adopted uffd Handler (nil until the va_report
+	// handshake completes). Restore-mode adoption precedes CH api-ready
+	// (journal evidence: the vareport log precedes vm.resume), so the
+	// getter is non-nil by the time PostSpawn runs; callers must still
+	// treat nil as "no handler".
+	Uffd func() *uffd.Handler
 }
 
 // VMParams is the input to ServeAndWait — everything the shared
@@ -1207,6 +1213,11 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		CHSock:       chSock,
 		Logf:         logf,
 		NotifyReady:  notifyReady,
+		Uffd: func() *uffd.Handler {
+			uffdHandlerMu.Lock()
+			defer uffdHandlerMu.Unlock()
+			return uffdHandler
+		},
 	}); err != nil {
 		if readFatal() != nil || !runShutdownRequested(p.Ctx) {
 			_ = cmd.Process.Kill()

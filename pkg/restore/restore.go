@@ -716,6 +716,20 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 				time.Since(tRestore).Microseconds(), muxSpec.TTY)
 			p.Dur("restore.ack", tRestore)
 			p.Mark("restore.ready")
+			// restore.uffd_delta: one absolute uffd counter snapshot per
+			// restore op (the sandbox-runner process serves exactly one op,
+			// so counters start at zero). Re-planted from the deployed
+			// baseline binary so the series baseline and P3 both carry the
+			// storm-accounting fields (AB2 journal / probe-uffd-basis4).
+			if pc.Uffd != nil {
+				if h := pc.Uffd(); h != nil {
+					delta := make(map[string]any, 48)
+					for k, v := range h.Stats() {
+						delta[k] = v
+					}
+					p.MarkKV("restore.uffd_delta", delta)
+				}
+			}
 			pc.Pinger.Start(pc.Ctx)
 			// Settled is only the node reservation lifecycle fact. Publish it as
 			// soon as ACK + MUX establishes the restored sandbox; it must not be
