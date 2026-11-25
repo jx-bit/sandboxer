@@ -1690,6 +1690,90 @@ func handleSnapshotRequest(
 	if sourceGuard != nil {
 		defer func() { err = errors.Join(err, sourceGuard.Close()) }()
 	}
+
+	// ★ PAUSE-PARALLEL (issue #2, candidate A): the guest quiesce phase runs
+	// CONCURRENTLY with host-side artifact prep. The vsock roundtrip waits on
+	// the guest (usage stop → exec drain → cgroupFreeze → sync → teardown EOF)
+	// while the host does disks/history/sink/membarrier prep — resource-
+	// independent. Join at the freeze boundary (before CaptureState and
+	// snapshot.Take). Any failure on either side routes through failRecovery
+	// — the guest may have frozen mid-phase, and that path already recovers.
+	guestRecoveryRequired := true
+	recoveryTerminated := false
+	reattachRunningGuest := func(reason string) error {
+		if !guestRecoveryRequired {
+			return nil
+		}
+		if reattachMUX == nil {
+			return fmt.Errorf("snapshot: cannot recover guest after %s: stdio MUX re-attach is unavailable", reason)
+		}
+		if reattachErr := reattachMUX(); reattachErr != nil {
+			return fmt.Errorf("snapshot: stdio MUX re-attach after %s: %w", reason, reattachErr)
+		}
+		logf("stdio MUX re-attached after %s", reason)
+		guestRecoveryRequired = false
+		return nil
+	}
+	failRecovery := func(recoveryErr error) error {
+		if recoveryErr == nil {
+			return nil
+		}
+		shutdownErr, terminal := terminateAfterCaptureRecoveryFailure(
+			chSock, chProcess, chExited, opts.Cfg.CHApiDeadline(), logf)
+		recoveryTerminated = terminal
+		combined := errors.Join(recoveryErr, shutdownErr)
+		if terminal {
+			return &terminalCaptureError{err: combined}
+		}
+		return combined
+	}
+	type guestQuiescePhaseOutcome struct {
+		dropCachesResult proto.DropCachesResult
+		err              error
+	}
+	quiesceDone := make(chan guestQuiescePhaseOutcome, 1)
+	quiesceJoined := false
+	go func() {
+		if forwarder != nil {
+			forwarder.Pause()
+		}
+		if pinger != nil {
+			if pauseErr := pinger.PauseContext(ctx); pauseErr != nil {
+				pinger.Resume()
+				quiesceDone <- guestQuiescePhaseOutcome{proto.DropCachesUnknown,
+					fmt.Errorf("snapshot: drain pinger before quiesce: %w", pauseErr)}
+				return
+			}
+		}
+		client := &guestlink.HostClient{BasePath: filepath.Join(runDir, "vsock.sock"), Logf: logf}
+		if pinger != nil && pinger.Client != nil {
+			client = pinger.Client
+		}
+		guestRecoveryRequired = true
+		result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
+		if qerr != nil {
+			quiesceDone <- guestQuiescePhaseOutcome{proto.DropCachesUnknown, fmt.Errorf("quiesce: %w", qerr)}
+			return
+		}
+		if forwarder != nil {
+			forwarder.Drain()
+		}
+		quiesceDone <- guestQuiescePhaseOutcome{result, nil}
+	}()
+	// Prep failures return before the explicit join below; this deferred join
+	// waits for the in-flight quiesce and routes recovery exactly like the
+	// serial flow's quiesce-failure path (failRecovery).
+	quiesceJoined = true
+	defer func() {
+		if quiesceJoined {
+			return
+		}
+		outcome := <-quiesceDone
+		if outcome.err != nil {
+			err = errors.Join(err, fmt.Errorf("quiesce: %w", outcome.err))
+		}
+		_ = failRecovery(reattachRunningGuest("host prep failed during guest quiesce"))
+	}()
 	opts, diffs, diskMerged, mergeBaseOpener, err := prepareCheckpointDisks(ctx, opts, disks)
 	if err != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: checkpoint disks: %w", err)
@@ -1879,35 +1963,6 @@ func handleSnapshotRequest(
 		releaseMemoryBarrier()
 	}()
 
-	guestRecoveryRequired := false
-	recoveryTerminated := false
-	reattachRunningGuest := func(reason string) error {
-		if !guestRecoveryRequired {
-			return nil
-		}
-		if reattachMUX == nil {
-			return fmt.Errorf("snapshot: cannot recover guest after %s: stdio MUX re-attach is unavailable", reason)
-		}
-		if reattachErr := reattachMUX(); reattachErr != nil {
-			return fmt.Errorf("snapshot: stdio MUX re-attach after %s: %w", reason, reattachErr)
-		}
-		logf("stdio MUX re-attached after %s", reason)
-		guestRecoveryRequired = false
-		return nil
-	}
-	failRecovery := func(recoveryErr error) error {
-		if recoveryErr == nil {
-			return nil
-		}
-		shutdownErr, terminal := terminateAfterCaptureRecoveryFailure(
-			chSock, chProcess, chExited, opts.Cfg.CHApiDeadline(), logf)
-		recoveryTerminated = terminal
-		combined := errors.Join(recoveryErr, shutdownErr)
-		if terminal {
-			return &terminalCaptureError{err: combined}
-		}
-		return combined
-	}
 	previousMemoryHigh, memoryHighLock, liftErr := liftVMMMemoryHigh(cgroupPath)
 	if liftErr != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: lift VMM memory.high: %w", liftErr)
@@ -1964,14 +2019,21 @@ func handleSnapshotRequest(
 	// reverse-channel close; after `quiesced`, Drain joins the host handlers so
 	// no teardown can race /vm.pause. Resume mirrors the pinger: stay paused only
 	// on the success + destroy path.
-	forwarderNeedsAbort := false
+	// ★ PAUSE-PARALLEL: join the guest quiesce phase (launched concurrently
+	// with host-side artifact prep). quiesce err ≠ nil ⇒ the guest may have
+	// frozen mid-phase ⇒ failRecovery (abort + reattach + terminate semantics
+	// unchanged from the serial flow's quiesce-failure path).
+	outcome := <-quiesceDone
+	if outcome.err != nil {
+		operationErr := fmt.Errorf("quiesce: %w", outcome.err)
+		logf("quiesce: %v (aborting snapshot)", operationErr)
+		return ctl.Response{}, errors.Join(operationErr, failRecovery(reattachRunningGuest("failed quiesce")))
+	}
+	dropCachesResult = outcome.dropCachesResult
+	guestQuiesced = true
+	logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", outcome.dropCachesResult)
 	if forwarder != nil {
-		forwarder.Pause()
-		forwarderNeedsAbort = true
 		defer func() {
-			if forwarderNeedsAbort {
-				forwarder.AbortAndDrain()
-			}
 			if recoveryTerminated {
 				return
 			}
@@ -1982,16 +2044,6 @@ func handleSnapshotRequest(
 		}()
 	}
 	if pinger != nil {
-		if pauseErr := pinger.PauseContext(ctx); pauseErr != nil {
-			pinger.Resume()
-			return ctl.Response{}, fmt.Errorf("snapshot: drain pinger before quiesce: %w", pauseErr)
-		}
-		// Resume on the way out UNLESS this is the success + destroy
-		// path: there the VM stays paused while destroyAfterSnapshot
-		// tears it down, so a resumed pinger only spews misleading
-		// `ping ... i/o timeout` lines against a paused/dying VM. On
-		// error (sandbox keeps running) or --resume (sandbox resumed),
-		// the pinger must come back.
 		defer func() {
 			if recoveryTerminated {
 				return
@@ -2002,28 +2054,6 @@ func handleSnapshotRequest(
 			pinger.Resume()
 		}()
 	}
-	client := &guestlink.HostClient{BasePath: filepath.Join(runDir, "vsock.sock"), Logf: logf}
-	if pinger != nil && pinger.Client != nil {
-		client = pinger.Client
-	}
-	guestRecoveryRequired = true
-	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
-	if qerr != nil {
-		if forwarderNeedsAbort {
-			forwarder.AbortAndDrain()
-			forwarderNeedsAbort = false
-		}
-		operationErr := fmt.Errorf("quiesce: %w", qerr)
-		logf("quiesce: %v (aborting snapshot)", operationErr)
-		return ctl.Response{}, errors.Join(operationErr, failRecovery(reattachRunningGuest("failed quiesce")))
-	}
-	if forwarder != nil {
-		forwarder.Drain()
-		forwarderNeedsAbort = false
-	}
-	dropCachesResult = result
-	guestQuiesced = true
-	logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", result)
 	// Record the last guest observation together with one exact CH target/current
 	// pair at the freeze boundary. BeginSnapshot still holds the balloon mutation
 	// gate, and a successful guest quiesce has already stopped the application;
