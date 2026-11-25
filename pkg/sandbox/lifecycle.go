@@ -1799,56 +1799,7 @@ func handleSnapshotRequest(
 			err = errors.Join(err, sink.Close())
 		}
 	}()
-	if bundleSink != nil {
-		bundleRefReplacements, err = dependencyPlan.Ingest(ctx, bundleSink, logf)
-	} else {
-		bundleRefReplacements, err = dependencyPlan.Emit(ctx, sink, logf)
-	}
-	planCloseErr := dependencyPlan.Close()
-	dependencyPlanOpen = false
-	if err != nil || planCloseErr != nil {
-		return ctl.Response{}, fmt.Errorf("snapshot dependencies: %w", errors.Join(err, planCloseErr))
-	}
-
 	cfg := opts.Cfg
-	var historicalRef string
-	if history.historical != nil {
-		historicalSource, _, buildErr := snapshot.BuildCaptureSource(ctx, sink, history.memory, nil, history.configJSON, history.stateJSON, history.snapshotConfig, history.fullMemory, history.fullMemory, history.proofCandidates, logf)
-		if buildErr != nil {
-			return ctl.Response{}, buildErr
-		}
-		var writeErr error
-		historicalRef, _, writeErr = sink.AbsorbSnapshot(ctx, historicalSource)
-		if closeErr := history.Close(); writeErr != nil || closeErr != nil {
-			return ctl.Response{}, errors.Join(writeErr, closeErr)
-		}
-	}
-	captureC0 := opts.PortableConfig
-	captureMemoryRefs := append([]string(nil), resultMemoryRefs...)
-	captureParentSandboxRef := ""
-	if opts.SourceBinding != nil {
-		captureParentSandboxRef = opts.SourceBinding.SandboxRef
-	}
-	if len(bundleRefReplacements) != 0 {
-		captureC0, err = opts.PortableConfig.RewriteDiskArtifactRefs(bundleRefReplacements)
-		if err != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot dependency ref rewrite: %w", err)
-		}
-		if replacement := bundleRefReplacements[captureParentSandboxRef]; replacement != "" {
-			captureParentSandboxRef = replacement
-		}
-		for i := range captureMemoryRefs {
-			if replacement := bundleRefReplacements[captureMemoryRefs[i]]; replacement != "" {
-				captureMemoryRefs[i] = replacement
-			}
-		}
-	}
-	if historicalRef != "" {
-		captureMemoryRefs = append([]string{historicalRef}, captureMemoryRefs...)
-	}
-	if err := validateProspectiveMemoryConfig(captureMemoryRefs); err != nil {
-		return ctl.Response{}, fmt.Errorf("snapshot: rewritten memory config: %w", err)
-	}
 	sandboxID := opts.SandboxID
 	if opts.usageSampler != nil {
 		opts.usageSampler.Pause()
@@ -1862,6 +1813,10 @@ func handleSnapshotRequest(
 	// Every predictable output, admission, dependency, merge and provenance
 	// check has completed. Hold the memory/Budget mutation barrier only for the
 	// actual freeze/capture/commit window and ordered destroy/resume recovery.
+	// The window now also spans the dependency emit, which runs beside the
+	// guest quiesce: only sink-write failures can still surface after this
+	// point, and they recover by thawing the guest instead of a clean
+	// pre-quiesce rejection.
 	releaseMemoryBarrier := func() {}
 	if memoryController != nil {
 		var barrierErr error
@@ -2007,23 +1962,143 @@ func handleSnapshotRequest(
 		client = pinger.Client
 	}
 	guestRecoveryRequired = true
-	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
-	if qerr != nil {
+
+	// The guest round trip runs CONCURRENTLY with the host-side dependency
+	// emit below: they touch disjoint resources — the round trip waits on
+	// the guest (sync, drop_caches, MUX close) while the emit streams
+	// dependency artifacts through the sink. BeginSnapshot above still holds
+	// the balloon mutation gate for the whole window, so the freeze boundary
+	// semantics are unchanged; the join sits before CaptureState and
+	// snapshot.Take, the first operations that observe both sides.
+	//
+	// A dependency failure cancels the in-flight round trip through qctx (the
+	// launch client aborts the connection via its context deadline) and takes
+	// the same failRecovery path as a failed quiesce: the guest may have
+	// frozen mid-phase, and reattach thaws it while the sandbox keeps
+	// running. The predictable configuration checks all ran before the fork —
+	// only sink-write failures surface this way.
+	qctx, qcancel := context.WithCancel(ctx)
+	defer qcancel()
+	type quiesceOutcome struct {
+		result proto.DropCachesResult
+		err    error
+	}
+	qc := make(chan quiesceOutcome, 1)
+	var qRes quiesceOutcome
+	qJoined := false
+	awaitQuiesce := func() {
+		if !qJoined {
+			qRes = <-qc
+			qJoined = true
+		}
+	}
+	go func() {
+		// Keep the panic semantics of the serial form: a round-trip panic
+		// must not kill the process — convert it to the same error path the
+		// serial call would have unwound through.
+		defer func() {
+			if r := recover(); r != nil {
+				qc <- quiesceOutcome{err: fmt.Errorf("quiesce: guest round trip panicked: %v", r)}
+			}
+		}()
+		result, qerr := guestlink.SendQuiesceContext(qctx, client, !dropCaches)
+		qc <- quiesceOutcome{result: result, err: qerr}
+	}()
+
+	captureC0 := opts.PortableConfig
+	captureMemoryRefs := append([]string(nil), resultMemoryRefs...)
+	captureParentSandboxRef := ""
+	if opts.SourceBinding != nil {
+		captureParentSandboxRef = opts.SourceBinding.SandboxRef
+	}
+
+	// Host-side dependency emit. This block used to run serially before the
+	// quiesce; everything that can reject the request without emitting
+	// anything (plan construction, sink construction) already ran before the
+	// fork, so what remains here streams through the sink and may fail while
+	// the guest is already quiescing.
+	depsErr := func() error {
+		var emitErr error
+		if bundleSink != nil {
+			bundleRefReplacements, emitErr = dependencyPlan.Ingest(ctx, bundleSink, logf)
+		} else {
+			bundleRefReplacements, emitErr = dependencyPlan.Emit(ctx, sink, logf)
+		}
+		planCloseErr := dependencyPlan.Close()
+		dependencyPlanOpen = false
+		if emitErr != nil || planCloseErr != nil {
+			return fmt.Errorf("snapshot dependencies: %w", errors.Join(emitErr, planCloseErr))
+		}
+		var historicalRef string
+		if history.historical != nil {
+			historicalSource, _, buildErr := snapshot.BuildCaptureSource(ctx, sink, history.memory, nil, history.configJSON, history.stateJSON, history.snapshotConfig, history.fullMemory, history.fullMemory, history.proofCandidates, logf)
+			if buildErr != nil {
+				return buildErr
+			}
+			var writeErr error
+			historicalRef, _, writeErr = sink.AbsorbSnapshot(ctx, historicalSource)
+			if closeErr := history.Close(); writeErr != nil || closeErr != nil {
+				return errors.Join(writeErr, closeErr)
+			}
+		}
+		if len(bundleRefReplacements) != 0 {
+			rewritten, rewriteErr := opts.PortableConfig.RewriteDiskArtifactRefs(bundleRefReplacements)
+			if rewriteErr != nil {
+				return fmt.Errorf("snapshot dependency ref rewrite: %w", rewriteErr)
+			}
+			captureC0 = rewritten
+			if replacement := bundleRefReplacements[captureParentSandboxRef]; replacement != "" {
+				captureParentSandboxRef = replacement
+			}
+			for i := range captureMemoryRefs {
+				if replacement := bundleRefReplacements[captureMemoryRefs[i]]; replacement != "" {
+					captureMemoryRefs[i] = replacement
+				}
+			}
+		}
+		if historicalRef != "" {
+			captureMemoryRefs = append([]string{historicalRef}, captureMemoryRefs...)
+		}
+		if err := validateProspectiveMemoryConfig(captureMemoryRefs); err != nil {
+			return fmt.Errorf("snapshot: rewritten memory config: %w", err)
+		}
+		return nil
+	}()
+
+	// Rendezvous: CaptureState and snapshot.Take below need both the guest
+	// quiesced and the dependency refs finalized.
+	if depsErr != nil {
+		qcancel()
+	}
+	awaitQuiesce()
+	var quiesceErr error
+	if qRes.err != nil {
+		quiesceErr = fmt.Errorf("quiesce: %w", qRes.err)
+	}
+	if depsErr != nil && errors.Is(quiesceErr, context.Canceled) {
+		// The cancellation is mechanical — the dependency failure is the
+		// cause; do not bury it under "quiesce: context canceled".
+		quiesceErr = nil
+	}
+	if opErr := errors.Join(depsErr, quiesceErr); opErr != nil {
 		if forwarderNeedsAbort {
 			forwarder.AbortAndDrain()
 			forwarderNeedsAbort = false
 		}
-		operationErr := fmt.Errorf("quiesce: %w", qerr)
-		logf("quiesce: %v (aborting snapshot)", operationErr)
-		return ctl.Response{}, errors.Join(operationErr, failRecovery(reattachRunningGuest("failed quiesce")))
+		logf("snapshot: %v (aborting capture, recovering guest)", opErr)
+		reason := "failed quiesce"
+		if depsErr != nil {
+			reason = "failed dependency emit"
+		}
+		return ctl.Response{}, errors.Join(opErr, failRecovery(reattachRunningGuest(reason)))
 	}
 	if forwarder != nil {
 		forwarder.Drain()
 		forwarderNeedsAbort = false
 	}
-	dropCachesResult = result
+	dropCachesResult = qRes.result
 	guestQuiesced = true
-	logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", result)
+	logf("quiesce: guest acked (drop_caches=%s, MUX + forwards closed), proceeding to /vm.pause", qRes.result)
 	// Record the last guest observation together with one exact CH target/current
 	// pair at the freeze boundary. BeginSnapshot still holds the balloon mutation
 	// gate, and a successful guest quiesce has already stopped the application;
