@@ -219,6 +219,78 @@ func TestTakeSinkCloseFailureResumesBackendsAndCH(t *testing.T) {
 	}
 }
 
+func TestTakeSurfacesDiskLegFailureAndResumesCH(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "ch.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := t.TempDir()
+	var mu sync.Mutex
+	var requests []string
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/api/v1/vm.snapshot" {
+			// The CH leg completes even though the disk leg has failed; the
+			// artifacts are discarded at the join.
+			if writeErr := os.WriteFile(filepath.Join(staging, "config.json"), []byte(`{"vm":"config"}`), 0o600); writeErr != nil {
+				http.Error(w, writeErr.Error(), http.StatusInternalServerError)
+				return
+			}
+			if writeErr := os.WriteFile(filepath.Join(staging, "state.json"), []byte(`{"vm":"state"}`), 0o600); writeErr != nil {
+				http.Error(w, writeErr.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serveDone)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serveDone
+	})
+
+	quiescer := &recordingQuiescer{}
+	portable := exportTestPortable(t)
+	portable.Boot.Disks = nil
+	portable.Mounts = nil
+	out, err := Take(Sources{
+		SandboxID:      "disk-leg-failure",
+		APISock:        sock,
+		MemfdSize:      4096,
+		StagingDir:     staging,
+		CHApiDeadline:  time.Second,
+		PortableConfig: portable,
+		Diffs: []DiskDiff{{SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+			return nil, nil, errors.New("injected disk capture failure")
+		}}},
+		Quiescer: quiescer,
+	}, NewFileSink(t.TempDir(), "disk-leg-failure", nil, false, nil), false)
+	if out != nil {
+		t.Fatalf("Take outputs = %v, want nil when the disk leg fails", out)
+	}
+	if err == nil || !strings.Contains(err.Error(), "injected disk capture failure") {
+		t.Fatalf("Take error = %v, want injected disk capture failure", err)
+	}
+	mu.Lock()
+	got := strings.Join(requests, ",")
+	mu.Unlock()
+	// The CH snapshot runs to completion while the disk leg fails in
+	// parallel; vm.resume must still be the final CH request.
+	if want := "/api/v1/vm.pause,/api/v1/vm.snapshot,/api/v1/vm.resume"; got != want {
+		t.Fatalf("CH requests = %q, want %q", got, want)
+	}
+	if quiescer.quiesce != 1 || quiescer.resume != 1 {
+		t.Fatalf("quiescer calls = quiesce:%d resume:%d", quiescer.quiesce, quiescer.resume)
+	}
+}
+
 func TestTakeBuildsSandboxAndMemorySnapshotAtOneFreezePoint(t *testing.T) {
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "staging")
@@ -302,13 +374,47 @@ func TestTakeBuildsSandboxAndMemorySnapshotAtOneFreezePoint(t *testing.T) {
 		t.Fatalf("backend lifecycle quiesce=%d resume=%d frozen=%v",
 			quiescer.quiesce.Load(), quiescer.resume.Load(), quiescer.frozen.Load())
 	}
-	wantOrder := []string{
-		"ch:/api/v1/vm.pause", "disk-view", "sink:sandbox",
-		"ch:/api/v1/vm.snapshot", "sink:snapshot", "sink:commit-snapshot",
-		"sink:close", "ch:/api/v1/vm.resume",
+	// The disk leg (T3) runs concurrently with the CH snapshot leg (T4); the
+	// interleaving is nondeterministic, so a total order is not assertable.
+	// Assert the invariants that still hold under concurrency: the event
+	// multiset, the freeze boundary (vm.pause first / vm.resume last), the
+	// per-leg internal order, and the join before the S flow (E's sink write
+	// completes before S's -- the memory flow needs E's content-addressed
+	// ref, and the sink must not see concurrent writers).
+	got := events.snapshot()
+	counts := make(map[string]int, len(got))
+	for _, e := range got {
+		counts[e]++
 	}
-	if got := events.snapshot(); !reflect.DeepEqual(got, wantOrder) {
-		t.Fatalf("snapshot E/S order = %v, want %v", got, wantOrder)
+	wantCounts := map[string]int{
+		"ch:/api/v1/vm.pause": 1, "ch:/api/v1/vm.snapshot": 1, "disk-view": 1,
+		"sink:sandbox": 1, "sink:snapshot": 1, "sink:commit-snapshot": 1,
+		"sink:close": 1, "ch:/api/v1/vm.resume": 1,
+	}
+	if !reflect.DeepEqual(counts, wantCounts) {
+		t.Fatalf("snapshot E/S events = %v (counts %v), want exactly %v", got, counts, wantCounts)
+	}
+	if got[0] != "ch:/api/v1/vm.pause" || got[len(got)-1] != "ch:/api/v1/vm.resume" {
+		t.Fatalf("freeze boundary broken: first=%q last=%q (order=%v)", got[0], got[len(got)-1], got)
+	}
+	pos := func(item string) int {
+		for i, e := range got {
+			if e == item {
+				return i
+			}
+		}
+		return -1
+	}
+	for _, pair := range [][2]string{
+		{"disk-view", "sink:sandbox"},               // T3 leg: view before sink write
+		{"ch:/api/v1/vm.snapshot", "sink:snapshot"}, // T4 before the S sink write
+		{"sink:sandbox", "sink:snapshot"},           // join before the S flow: E ref must exist
+		{"sink:snapshot", "sink:commit-snapshot"},   // S leg: write before commit
+		{"sink:commit-snapshot", "sink:close"},      // S leg: commit before close
+	} {
+		if pos(pair[0]) > pos(pair[1]) {
+			t.Fatalf("snapshot invariant %s < %s broken: order=%v", pair[0], pair[1], got)
+		}
 	}
 	parsedSnapshot, err := manifest.ParseRef(out.SnapshotRef)
 	if err != nil || out.SandboxRef != sink.sandboxRef || parsedSnapshot.Base().String() != sink.snapshotRef || parsedSnapshot.Runtime != (manifest.RuntimeIdentity{Basename: "runtime.bundle", Digest: strings.Repeat("a", 64)}) {
