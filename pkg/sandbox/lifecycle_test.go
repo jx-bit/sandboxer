@@ -1893,6 +1893,167 @@ func TestHandleSnapshotRequestQuiescesWithoutPinger(t *testing.T) {
 	}
 }
 
+func TestHandleSnapshotRequestJoinsDependencyLegWithQuiesceRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	events := &lifecycleEvents{}
+	release := make(chan struct{})
+	arrived := make(chan struct{})
+	guestDone := serveOneQuiesce(t, filepath.Join(runDir, "vsock.sock"), func(*proto.Message) error {
+		events.add("guest-quiesce")
+		close(arrived)
+		<-release
+		return nil
+	})
+	chSock, chRequests := serveLifecycleCH(t, dir, func(path string) int {
+		events.add("ch:" + path)
+		if path == "/api/v1/vm.pause" {
+			return http.StatusInternalServerError
+		}
+		return http.StatusNoContent
+	})
+	mfd, err := memory.Create("snapshot-dependency-join", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		// Hold the guest ack open while the dependency leg (plan + sink +
+		// emit) runs beside it. The rendezvous must wait for both legs
+		// before the capture gate opens.
+		<-arrived
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+	}()
+	viewCalled := false
+	reattachCalls := 0
+	_, err = handleSnapshotRequest(
+		context.Background(), ctl.Request{OutDir: filepath.Join(dir, "out"), ResumeAfter: true},
+		RunOptions{Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "test"},
+		mfd, []SnapDiskRef{{
+			DiffPath: filepath.Join(dir, "diff"), Size: 4096,
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				viewCalled = true
+				return bytes.NewReader(make([]byte, 4096)), nil, nil
+			},
+		}}, nil, chSock, runDir, "", nil, nil, nil, nil,
+		func() error {
+			reattachCalls++
+			events.add("reattach")
+			return nil
+		}, nil, discardLogf,
+	)
+	if err == nil || !strings.Contains(err.Error(), "CH pause") {
+		t.Fatalf("snapshot error = %v, want CH pause failure", err)
+	}
+	if guestErr := waitLifecycleResult(t, guestDone); guestErr != nil {
+		t.Fatal(guestErr)
+	}
+	if got, want := strings.Join(events.snapshot(), ","), "guest-quiesce,ch:/api/v1/vm.pause,reattach"; got != want {
+		t.Fatalf("snapshot recovery order = %q, want %q", got, want)
+	}
+	if chReqs := chRequests(); strings.Join(chReqs, ",") != "/api/v1/vm.pause" {
+		t.Fatalf("CH requests = %q, want %q", strings.Join(chReqs, ","), "/api/v1/vm.pause")
+	}
+	if viewCalled {
+		t.Fatal("disk SnapshotView opened after failed CH pause")
+	}
+	if reattachCalls != 1 {
+		t.Fatalf("reattach calls = %d, want 1", reattachCalls)
+	}
+}
+
+func TestHandleSnapshotRequestSurfacesDependencyLegFailureAndRecoversGuest(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The dependency leg fails at sink construction (customer key) while the
+	// guest quiesce round trip succeeds: the join must surface the dependency
+	// error and take the freeze-then-unfreeze recovery path BEFORE the
+	// capture gate opens (no CH request may be observed).
+	events := &lifecycleEvents{}
+	guestDone := serveOneQuiesce(t, filepath.Join(runDir, "vsock.sock"), func(*proto.Message) error {
+		events.add("guest-quiesce")
+		return nil
+	})
+	chSock, chRequests := serveLifecycleCH(t, dir, func(path string) int {
+		events.add("ch:" + path)
+		return http.StatusNoContent
+	})
+	mfd, err := memory.Create("snapshot-dependency-failure", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mfd.Close()
+	portable := snapshotTestPortable(t)
+	portable.Boot.Root = config.PortableRootConfig{Base: "self"}
+	if err := portable.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	viewCalled := false
+	reattachCalls := 0
+	_, err = handleSnapshotRequest(
+		context.Background(), ctl.Request{Upload: true, ResumeAfter: true},
+		RunOptions{
+			Cfg: &config.SandboxConfig{}, PortableConfig: portable, SandboxID: "test",
+			ManifestCfg: &config.ManifestConfig{Store: manifest.StoreConfig{Endpoint: "unused"}},
+			CustomerKeyFn: func() ([32]byte, error) {
+				events.add("customer-key")
+				return [32]byte{}, errors.New("invalid customer key")
+			},
+		},
+		mfd, []SnapDiskRef{{
+			DiffPath: filepath.Join(dir, "diff"), Size: 4096,
+			SnapshotView: func() (io.ReadSeeker, []sparse.Extent, error) {
+				viewCalled = true
+				return bytes.NewReader(make([]byte, 4096)), nil, nil
+			},
+		}}, nil, chSock, runDir, "", nil, nil, nil, nil,
+		func() error {
+			reattachCalls++
+			events.add("reattach")
+			return nil
+		}, nil, discardLogf,
+	)
+	if err == nil || !strings.Contains(err.Error(), "customer key") {
+		t.Fatalf("snapshot error = %v, want dependency leg failure", err)
+	}
+	if guestErr := waitLifecycleResult(t, guestDone); guestErr != nil {
+		t.Fatal(guestErr)
+	}
+	ck, attach := -1, -1
+	for i, e := range events.snapshot() {
+		if e == "customer-key" {
+			ck = i
+		}
+		if e == "reattach" {
+			attach = i
+		}
+	}
+	if ck < 0 || attach < 0 || ck > attach {
+		t.Fatalf("recovery order = %q, want customer-key before reattach (join ordering)", strings.Join(events.snapshot(), ","))
+	}
+	if chReqs := chRequests(); len(chReqs) != 0 {
+		t.Fatalf("CH requests = %q, want none before the capture gate", strings.Join(chReqs, ","))
+	}
+	if viewCalled {
+		t.Fatal("disk SnapshotView opened after failed dependency leg")
+	}
+	if reattachCalls != 1 {
+		t.Fatalf("reattach calls = %d, want 1", reattachCalls)
+	}
+}
+
 func TestHandleSnapshotRequestValidatesDiskMergeBaseBeforeQuiesce(t *testing.T) {
 	dir := t.TempDir()
 	diff := filepath.Join(dir, "must-not-be-opened.diff")
