@@ -1671,7 +1671,6 @@ func handleSnapshotRequest(
 			len(disks), 1+len(opts.Cfg.Boot.Disks))
 	}
 	var bundleSink *snapshot.BundleSink
-	var bundleAdmission store.WriteAdmission
 
 	stagingDir := filepath.Join(runDir, "snap-stage")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
@@ -1730,125 +1729,18 @@ func handleSnapshotRequest(
 	if mergeMemory {
 		memoryMergeBaseOpener = func(context.Context, string) (fetch.Stream, error) { return history.memory, nil }
 	}
-	var (
-		dependencyPlan        *snapshotBundlePlan
-		bundleRefReplacements map[string]string
-		dependencyPlanOpen    bool
-	)
-	defer func() {
-		if dependencyPlanOpen {
-			err = errors.Join(err, dependencyPlan.Close())
-		}
-	}()
-	if snapshotMode == ctl.SnapshotModeBundle && save == nil {
-		bundleAdmission, err = opts.ManifestCfg.WriteAdmission(ctx)
-		if err != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot Bundle admission: %w", err)
-		}
-		plan, planErr := prepareSnapshotBundlePlan(ctx, opts, resultMemoryRefs,
-			diskMerged, req.OutDir, bundleAdmission)
-		if planErr != nil {
-			return ctl.Response{}, planErr
-		}
-		dependencyPlan = plan
-		dependencyPlanOpen = true
-		bundleSink, err = snapshot.NewPlannedBundleSink(req.OutDir, opts.SandboxID,
-			opts.ManifestCfg, opts.CustomerKeyFn, bundleAdmission, plan.Refs(), logf)
-		if err != nil {
-			return ctl.Response{}, err
-		}
-	} else {
-		dependencyPlan, err = prepareSnapshotDependencyPlan(ctx, opts, resultMemoryRefs,
-			diskMerged, req.OutDir, store.WriteAdmission{}, false)
-		if err != nil {
-			return ctl.Response{}, err
-		}
-		dependencyPlanOpen = true
-	}
-
-	// Construct the sink before quiesce as well: malformed manifest/store
-	// configuration must not be discovered only after the guest is frozen.
-	var sink snapshot.ArtifactSink
-	var ingestSink *snapshot.IngestSink
-	if req.Upload {
-		if opts.CustomerKeyFn == nil {
-			return ctl.Response{}, fmt.Errorf("snapshot ingester: customer key resolver is unavailable")
-		}
-		if _, keyErr := opts.CustomerKeyFn(); keyErr != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot ingester: customer key: %w", keyErr)
-		}
-		ing, ierr := opts.ManifestCfg.NewIngester(opts.CustomerKeyFn, nil)
-		if ierr != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot ingester: %w", ierr)
-		}
-		ingestSink = snapshot.NewIngestSink(ing, logf)
-		sink = ingestSink
-	} else if save != nil && snapshotMode == ctl.SnapshotModeBundle {
-		sink, err = save.newSink()
-		if err != nil {
-			return ctl.Response{}, err
-		}
-	} else if snapshotMode == ctl.SnapshotModeBundle {
-		sink = bundleSink
-	} else {
-		sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, logf)
-	}
-	sinkOpen := true
-	defer func() {
-		if sinkOpen {
-			err = errors.Join(err, sink.Close())
-		}
-	}()
-	if bundleSink != nil {
-		bundleRefReplacements, err = dependencyPlan.Ingest(ctx, bundleSink, logf)
-	} else {
-		bundleRefReplacements, err = dependencyPlan.Emit(ctx, sink, logf)
-	}
-	planCloseErr := dependencyPlan.Close()
-	dependencyPlanOpen = false
-	if err != nil || planCloseErr != nil {
-		return ctl.Response{}, fmt.Errorf("snapshot dependencies: %w", errors.Join(err, planCloseErr))
-	}
-
+	// A2 fork point: the M leg (goroutine) covers the dependency plan + sink
+	// construction + historical absorb + emit + ref rewrite + prospective
+	// validation, while the Q leg (inline below) keeps the baseline
+	// usage/barrier/lift/drain/forwarder/pinger sequence and the quiesce
+	// round trip. The legs join before CaptureState and snapshot.Take. An
+	// M-leg failure cancels (or joins an already-acked) quiesce and recovers
+	// the guest via failRecovery: the sink fail-fast guard from the baseline
+	// comment below moves behind the quiesce boundary, the same semantics the
+	// A pilot already accepted.
+	qctx, qcancel := context.WithCancel(ctx)
+	defer qcancel()
 	cfg := opts.Cfg
-	var historicalRef string
-	if history.historical != nil {
-		historicalSource, _, buildErr := snapshot.BuildCaptureSource(ctx, sink, history.memory, nil, history.configJSON, history.stateJSON, history.snapshotConfig, history.fullMemory, history.fullMemory, history.proofCandidates, logf)
-		if buildErr != nil {
-			return ctl.Response{}, buildErr
-		}
-		var writeErr error
-		historicalRef, _, writeErr = sink.AbsorbSnapshot(ctx, historicalSource)
-		if closeErr := history.Close(); writeErr != nil || closeErr != nil {
-			return ctl.Response{}, errors.Join(writeErr, closeErr)
-		}
-	}
-	captureC0 := opts.PortableConfig
-	captureMemoryRefs := append([]string(nil), resultMemoryRefs...)
-	captureParentSandboxRef := ""
-	if opts.SourceBinding != nil {
-		captureParentSandboxRef = opts.SourceBinding.SandboxRef
-	}
-	if len(bundleRefReplacements) != 0 {
-		captureC0, err = opts.PortableConfig.RewriteDiskArtifactRefs(bundleRefReplacements)
-		if err != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot dependency ref rewrite: %w", err)
-		}
-		if replacement := bundleRefReplacements[captureParentSandboxRef]; replacement != "" {
-			captureParentSandboxRef = replacement
-		}
-		for i := range captureMemoryRefs {
-			if replacement := bundleRefReplacements[captureMemoryRefs[i]]; replacement != "" {
-				captureMemoryRefs[i] = replacement
-			}
-		}
-	}
-	if historicalRef != "" {
-		captureMemoryRefs = append([]string{historicalRef}, captureMemoryRefs...)
-	}
-	if err := validateProspectiveMemoryConfig(captureMemoryRefs); err != nil {
-		return ctl.Response{}, fmt.Errorf("snapshot: rewritten memory config: %w", err)
-	}
 	sandboxID := opts.SandboxID
 	if opts.usageSampler != nil {
 		opts.usageSampler.Pause()
@@ -1858,6 +1750,151 @@ func handleSnapshotRequest(
 			}
 		}()
 	}
+	var (
+		dependencyPlan          *snapshotBundlePlan
+		bundleRefReplacements   map[string]string
+		sink                    snapshot.ArtifactSink
+		ingestSink              *snapshot.IngestSink
+		sinkOpen                bool
+		dependencyPlanOpen      bool
+		historicalRef           string
+		captureC0               = opts.PortableConfig
+		captureMemoryRefs       = append([]string(nil), resultMemoryRefs...)
+		captureParentSandboxRef string
+	)
+	if opts.SourceBinding != nil {
+		captureParentSandboxRef = opts.SourceBinding.SandboxRef
+	}
+	defer func() {
+		if dependencyPlanOpen {
+			err = errors.Join(err, dependencyPlan.Close())
+		}
+		if sinkOpen {
+			err = errors.Join(err, sink.Close())
+		}
+	}()
+	depsDone := make(chan struct{})
+	var depsErr error
+	joinDeps := func() error {
+		<-depsDone
+		return depsErr
+	}
+	go func() {
+		defer close(depsDone)
+		var emitErr error
+		if snapshotMode == ctl.SnapshotModeBundle && save == nil {
+			bundleAdmission, admitErr := opts.ManifestCfg.WriteAdmission(ctx)
+			if admitErr != nil {
+				depsErr = fmt.Errorf("snapshot Bundle admission: %w", admitErr)
+				return
+			}
+			plan, planErr := prepareSnapshotBundlePlan(ctx, opts, resultMemoryRefs,
+				diskMerged, req.OutDir, bundleAdmission)
+			if planErr != nil {
+				depsErr = planErr
+				return
+			}
+			dependencyPlan = plan
+			dependencyPlanOpen = true
+			plannedSink, sinkErr := snapshot.NewPlannedBundleSink(req.OutDir, opts.SandboxID,
+				opts.ManifestCfg, opts.CustomerKeyFn, bundleAdmission, plan.Refs(), logf)
+			if sinkErr != nil {
+				depsErr = sinkErr
+				return
+			}
+			bundleSink = plannedSink
+		} else {
+			plan, planErr := prepareSnapshotDependencyPlan(ctx, opts, resultMemoryRefs,
+				diskMerged, req.OutDir, store.WriteAdmission{}, false)
+			if planErr != nil {
+				depsErr = planErr
+				return
+			}
+			dependencyPlan = plan
+			dependencyPlanOpen = true
+		}
+
+		// Construct the sink on the M leg: malformed manifest/store configuration
+		// is discovered after the quiesce round trip has started, which converts
+		// the former clean reject into a freeze-then-unfreeze recovery (the same
+		// semantics already accepted by the A pilot).
+		if req.Upload {
+			if opts.CustomerKeyFn == nil {
+				depsErr = fmt.Errorf("snapshot ingester: customer key resolver is unavailable")
+				return
+			}
+			if _, keyErr := opts.CustomerKeyFn(); keyErr != nil {
+				depsErr = fmt.Errorf("snapshot ingester: customer key: %w", keyErr)
+				return
+			}
+			ing, ierr := opts.ManifestCfg.NewIngester(opts.CustomerKeyFn, nil)
+			if ierr != nil {
+				depsErr = fmt.Errorf("snapshot ingester: %w", ierr)
+				return
+			}
+			ingestSink = snapshot.NewIngestSink(ing, logf)
+			sink = ingestSink
+		} else if save != nil && snapshotMode == ctl.SnapshotModeBundle {
+			s, sinkErr := save.newSink()
+			if sinkErr != nil {
+				depsErr = sinkErr
+				return
+			}
+			sink = s
+		} else if snapshotMode == ctl.SnapshotModeBundle {
+			sink = bundleSink
+		} else {
+			sink = snapshot.NewFileSink(req.OutDir, opts.SandboxID, opts.LocalCodec, opts.LocalRequired, logf)
+		}
+		sinkOpen = true
+		if bundleSink != nil {
+			bundleRefReplacements, emitErr = dependencyPlan.Ingest(ctx, bundleSink, logf)
+		} else {
+			bundleRefReplacements, emitErr = dependencyPlan.Emit(ctx, sink, logf)
+		}
+		planCloseErr := dependencyPlan.Close()
+		dependencyPlanOpen = false
+		if emitErr != nil || planCloseErr != nil {
+			depsErr = fmt.Errorf("snapshot dependencies: %w", errors.Join(emitErr, planCloseErr))
+			return
+		}
+		if history.historical != nil {
+			historicalSource, _, buildErr := snapshot.BuildCaptureSource(ctx, sink, history.memory, nil, history.configJSON, history.stateJSON, history.snapshotConfig, history.fullMemory, history.fullMemory, history.proofCandidates, logf)
+			if buildErr != nil {
+				depsErr = buildErr
+				return
+			}
+			var writeErr error
+			historicalRef, _, writeErr = sink.AbsorbSnapshot(ctx, historicalSource)
+			if closeErr := history.Close(); writeErr != nil || closeErr != nil {
+				depsErr = errors.Join(writeErr, closeErr)
+				return
+			}
+		}
+		if len(bundleRefReplacements) != 0 {
+			rewritten, rewriteErr := opts.PortableConfig.RewriteDiskArtifactRefs(bundleRefReplacements)
+			if rewriteErr != nil {
+				depsErr = fmt.Errorf("snapshot dependency ref rewrite: %w", rewriteErr)
+				return
+			}
+			captureC0 = rewritten
+			if replacement := bundleRefReplacements[captureParentSandboxRef]; replacement != "" {
+				captureParentSandboxRef = replacement
+			}
+			for i := range captureMemoryRefs {
+				if replacement := bundleRefReplacements[captureMemoryRefs[i]]; replacement != "" {
+					captureMemoryRefs[i] = replacement
+				}
+			}
+		}
+		if historicalRef != "" {
+			captureMemoryRefs = append([]string{historicalRef}, captureMemoryRefs...)
+		}
+		if validateErr := validateProspectiveMemoryConfig(captureMemoryRefs); validateErr != nil {
+			depsErr = fmt.Errorf("snapshot: rewritten memory config: %w", validateErr)
+			return
+		}
+	}()
 
 	// Every predictable output, admission, dependency, merge and provenance
 	// check has completed. Hold the memory/Budget mutation barrier only for the
@@ -1867,7 +1904,7 @@ func handleSnapshotRequest(
 		var barrierErr error
 		releaseMemoryBarrier, barrierErr = memoryController.BeginSnapshot(ctx)
 		if barrierErr != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: begin memory Budget barrier: %w", barrierErr)
+			return ctl.Response{}, errors.Join(fmt.Errorf("snapshot: begin memory Budget barrier: %w", barrierErr), joinDeps())
 		}
 	}
 	defer func() {
@@ -1910,7 +1947,7 @@ func handleSnapshotRequest(
 	}
 	previousMemoryHigh, memoryHighLock, liftErr := liftVMMMemoryHigh(cgroupPath)
 	if liftErr != nil {
-		return ctl.Response{}, fmt.Errorf("snapshot: lift VMM memory.high: %w", liftErr)
+		return ctl.Response{}, errors.Join(fmt.Errorf("snapshot: lift VMM memory.high: %w", liftErr), joinDeps())
 	}
 	if previousMemoryHigh != nil && strings.TrimSpace(string(previousMemoryHigh)) != "max" {
 		logf("snapshot: lifted VMM memory.high for quiesce/pause/snapshot lifecycle")
@@ -1937,7 +1974,7 @@ func handleSnapshotRequest(
 	if drainDelay := vmmMemoryHighThrottleDrainDelay(cgroupPath, previousMemoryHigh); drainDelay > 0 {
 		logf("snapshot: waiting %s for existing VMM memory.high throttles to drain", drainDelay)
 		if drainErr := waitVMMMemoryHighThrottleDrain(drainDelay, chExited); drainErr != nil {
-			return ctl.Response{}, fmt.Errorf("snapshot: drain VMM memory.high throttles: %w", drainErr)
+			return ctl.Response{}, errors.Join(fmt.Errorf("snapshot: drain VMM memory.high throttles: %w", drainErr), joinDeps())
 		}
 	}
 
@@ -1984,7 +2021,7 @@ func handleSnapshotRequest(
 	if pinger != nil {
 		if pauseErr := pinger.PauseContext(ctx); pauseErr != nil {
 			pinger.Resume()
-			return ctl.Response{}, fmt.Errorf("snapshot: drain pinger before quiesce: %w", pauseErr)
+			return ctl.Response{}, errors.Join(fmt.Errorf("snapshot: drain pinger before quiesce: %w", pauseErr), joinDeps())
 		}
 		// Resume on the way out UNLESS this is the success + destroy
 		// path: there the VM stays paused while destroyAfterSnapshot
@@ -2007,19 +2044,39 @@ func handleSnapshotRequest(
 		client = pinger.Client
 	}
 	guestRecoveryRequired = true
-	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
+	result, qerr := guestlink.SendQuiesceContext(qctx, client, !dropCaches)
 	if qerr != nil {
 		if forwarderNeedsAbort {
 			forwarder.AbortAndDrain()
 			forwarderNeedsAbort = false
 		}
+		qcancel()
+		joinErr := joinDeps()
 		operationErr := fmt.Errorf("quiesce: %w", qerr)
+		if joinErr != nil {
+			if errors.Is(qerr, context.Canceled) {
+				// The M leg failed and cancelled the in-flight quiesce:
+				// surface the dependency error instead of the bare
+				// cancellation.
+				operationErr = joinErr
+			} else {
+				operationErr = errors.Join(operationErr, joinErr)
+			}
+		}
 		logf("quiesce: %v (aborting snapshot)", operationErr)
 		return ctl.Response{}, errors.Join(operationErr, failRecovery(reattachRunningGuest("failed quiesce")))
 	}
 	if forwarder != nil {
 		forwarder.Drain()
 		forwarderNeedsAbort = false
+	}
+	// A2 join: wait for the M leg before the freeze observation and
+	// snapshot.Take. An M-leg failure after the guest acked quiesce takes the
+	// freeze-then-unfreeze recovery path (reattachRunningGuest), mirroring
+	// the A pilot.
+	if depsErr := joinDeps(); depsErr != nil {
+		logf("snapshot: dependency leg failed after quiesce: %v", depsErr)
+		return ctl.Response{}, errors.Join(depsErr, failRecovery(reattachRunningGuest("failed dependency leg")))
 	}
 	dropCachesResult = result
 	guestQuiesced = true
