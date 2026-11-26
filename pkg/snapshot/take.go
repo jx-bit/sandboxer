@@ -269,33 +269,86 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 
 	// T3: capture all disks once and emit Sandbox E while the same CH/backend
 	// freeze remains held. E is a dependency, not yet the operation root.
+	//
+	// T3 runs concurrently with T4 below: they touch disjoint resources — T3
+	// streams the disk diffs to the sink while T4 waits on the CH API and
+	// reads the two small staging files. The CH API is a single-threaded event
+	// loop, so T4 and T6 cannot overlap each other; T3 is the only leg that
+	// can run beside them. The sink sees no concurrent writers: T3 alone owns
+	// it until the join, and T7 (build/absorb) starts only after it. Join
+	// before T5, which needs E's content-addressed ref.
 	dumpStart := time.Now()
-	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{
-		CheckpointID: s.CheckpointID, checkpointState: checkpointState,
-		SandboxID: s.SandboxID, PortableConfig: s.PortableConfig,
-		ParentSandboxRef: s.ParentSandboxRef, Diffs: s.Diffs,
-		LocalCodec: s.LocalCodec, LocalRequired: s.LocalRequired,
-		MergeBaseOpener: s.MergeBaseOpener,
-	}, sink, false)
-	if err != nil {
-		return nil, err
+	type sandboxCapture struct {
+		out *SandboxOutput
+		err error
 	}
-	out.SandboxRef, out.SandboxPath = sandboxOut.SandboxRef, sandboxOut.SandboxPath
+	t3c := make(chan sandboxCapture, 1)
+	t3Joined := false
+	var t3Res sandboxCapture
+	awaitT3 := func() {
+		if !t3Joined {
+			t3Res = <-t3c
+			t3Joined = true
+		}
+	}
+	go func() {
+		// Keep the panic semantics of the serial form: a T3 panic must not
+		// kill the process — convert it to the same error path the serial
+		// call would have unwound through.
+		defer func() {
+			if r := recover(); r != nil {
+				t3c <- sandboxCapture{err: fmt.Errorf("snapshot: disk capture panicked: %v", r)}
+			}
+		}()
+		captured, captureErr := captureSandboxAtFreeze(ctx, ExportSources{
+			CheckpointID: s.CheckpointID, checkpointState: checkpointState,
+			SandboxID: s.SandboxID, PortableConfig: s.PortableConfig,
+			ParentSandboxRef: s.ParentSandboxRef, Diffs: s.Diffs,
+			LocalCodec: s.LocalCodec, LocalRequired: s.LocalRequired,
+			MergeBaseOpener: s.MergeBaseOpener,
+		}, sink, false)
+		t3c <- sandboxCapture{out: captured, err: captureErr}
+	}()
+	t3ErrHandled := false
+	defer func() {
+		// Registered after the sink-close defer, so it runs before it: no
+		// return path between fork and join may leave T3 writing to a closed
+		// sink. Surface an unobserved T3 error instead of dropping it.
+		awaitT3()
+		if t3Res.err != nil && !t3ErrHandled {
+			retErr = errors.Join(retErr, fmt.Errorf("snapshot: disk capture (parallel leg): %w", t3Res.err))
+		}
+	}()
 
 	// T4: CH /vm.snapshot → staging dir. CH writes only config.json + state.json
 	// there (small); the multi-GiB memory + disk never touch the staging tmpfs —
 	// they stream straight to the sink.
 	if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
-		return nil, fmt.Errorf("CH snapshot: %w", err)
+		awaitT3()
+		t3ErrHandled = true
+		return nil, errors.Join(t3Res.err, fmt.Errorf("CH snapshot: %w", err))
 	}
 	configJSON, err := os.ReadFile(filepath.Join(s.StagingDir, "config.json"))
 	if err != nil {
-		return nil, fmt.Errorf("read config.json: %w", err)
+		awaitT3()
+		t3ErrHandled = true
+		return nil, errors.Join(t3Res.err, fmt.Errorf("read config.json: %w", err))
 	}
 	stateJSON, err := os.ReadFile(filepath.Join(s.StagingDir, "state.json"))
 	if err != nil {
-		return nil, fmt.Errorf("read state.json: %w", err)
+		awaitT3()
+		t3ErrHandled = true
+		return nil, errors.Join(t3Res.err, fmt.Errorf("read state.json: %w", err))
 	}
+
+	// Rendezvous: T5 needs E's content-addressed ref, which exists only once
+	// the disk capture has fully streamed through the sink.
+	awaitT3()
+	if t3Res.err != nil {
+		t3ErrHandled = true
+		return nil, t3Res.err
+	}
+	out.SandboxRef, out.SandboxPath = t3Res.out.SandboxRef, t3Res.out.SandboxPath
 
 	// T5: the memory-only snapshot.cfg points at E and carries only the memory
 	// parent chain.
